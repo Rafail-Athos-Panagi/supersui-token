@@ -1,0 +1,9 @@
+# Sui Move build
+build/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
