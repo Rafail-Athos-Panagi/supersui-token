@@ -1,4 +1,4 @@
-#[allow(duplicate_alias, lint(public_entry))]
+#[allow(duplicate_alias, lint(public_entry), unused_const)]
 module ssui::ssui {
     use sui::balance;
     use sui::coin::{Self, Coin, TreasuryCap};
@@ -27,28 +27,51 @@ module ssui::ssui {
     const ERROR_INVALID_THRESHOLD: u64 = 11;
     const ERROR_ALREADY_SIGNED: u64 = 12;
     const ERROR_NOT_MULTISIG_SIGNER: u64 = 13;
+    const ERROR_CONTRACT_PAUSED: u64 = 14;
+    const ERROR_UNAUTHORIZED_CALLER: u64 = 15;
+    const ERROR_INVALID_FEE_BPS: u64 = 16;
+    const ERROR_ADMIN_CAP_MISMATCH: u64 = 17;
+    const ERROR_INVALID_INPUT: u64 = 18;
+    const ERROR_INVALID_ACTION_TYPE: u64 = 19;
+    const ERROR_BATCH_TOO_LARGE: u64 = 20;
+    const ERROR_MAX_MINTERS_REACHED: u64 = 21;
+    const ERROR_MAX_ALLOWLIST_REACHED: u64 = 22;
+    const ERROR_MINTER_NOT_FOUND: u64 = 23;
     
     // ==================== Constants ====================
     // 9 decimals: 1 SSUI = 1_000_000_000 raw units (like SUI/MIST). Total 1.1B SSUI.
     const DECIMALS: u8 = 9;
     const TOTAL_SUPPLY: u64 = 1_100_000_000_000_000_000; // 1.1 billion SSUI (with 9 decimals)
-    const CREATOR_SUPPLY: u64 = 1_000_000_000_000_000_000; // 1 billion SSUI to creator
-    const CONTRACT_SUPPLY: u64 = 100_000_000_000_000_000; // 100 million SSUI to matrix platform (contract pool)
+    const CREATOR_SUPPLY: u64 = 1_100_000_000_000_000_000; // 1.1 billion SSUI to creator
+    const CONTRACT_SUPPLY: u64 = 0; // Contract pool starts empty; creator deposits later
     const LOGO_URL: vector<u8> = b"https://i.postimg.cc/1X6mTW3h/ssui.png";
     
     // Exchange and project integration constants
-    const MAX_FEE_BPS: u64 = 10000; // 100% in basis points
+    const MAX_FEE_BPS: u64 = 1000; // 10% max in basis points
     const DEFAULT_TRANSFER_FEE_BPS: u64 = 0; // 0% default transfer fee
 
     // ==================== Production Security Constants ====================
     const TIMELOCK_DURATION_MS: u64 = 172800000; // 48 hours in milliseconds (2 days)
     const MAX_MULTISIG_SIGNERS: u64 = 10; // Maximum number of multisig signers
+    const MAX_BATCH_SIZE: u64 = 200; // Safety: max recipients per batch_transfer call
+    const MAX_AUTHORIZED_MINTERS: u64 = 50; // Max authorized minters
+    const MAX_ALLOWLIST_SIZE: u64 = 500; // Max allowlist entries
 
-    // ==================== Structs ====================
+    // Valid multisig action types
+    const ACTION_TRANSFER_OWNERSHIP: u8 = 1;
+    const ACTION_SET_FEE: u8 = 2;
+    const ACTION_TOGGLE_PAUSE: u8 = 3;
+
+    // Valid timelock action types
+    const TIMELOCK_SET_FEE: u8 = 1;
+    const TIMELOCK_SET_FEE_RECIPIENT: u8 = 2;
+    const TIMELOCK_TOGGLE_PAUSE: u8 = 3;
+
+    // ==================== Structs ==
     
     public struct SSUI has drop {}
 
-    public struct AdminCap has key, store {
+    public struct AdminCap has key {
         id: UID,
         owner: address,
     }
@@ -100,13 +123,13 @@ module ssui::ssui {
         id: UID,
         signers: vector<address>,
         threshold: u64, // Number of signatures required
-        nonce: u64, // Prevents replay attacks
+        nonce: u64, // Action counter for tracking
     }
 
     /// Pending Multisig Action - Tracks pending actions requiring signatures
     public struct PendingAction has key, store {
         id: UID,
-        action_type: u8, // 1=transfer_ownership, 2=set_fee, 3=pause, 4=add_minter
+        action_type: u8, // 1=transfer_ownership, 2=set_fee, 3=pause
         target_address: address,
         amount: u64,
         execute_after: u64, // Timestamp when action can be executed
@@ -213,6 +236,44 @@ module ssui::ssui {
         executed_by: address,
     }
 
+    public struct MultisigActionCancelledEvent has copy, drop {
+        action_id: ID,
+        cancelled_by: address,
+    }
+
+    public struct TimelockCancelledEvent has copy, drop {
+        action_id: ID,
+        cancelled_by: address,
+    }
+
+    public struct OwnershipTransferredEvent has copy, drop {
+        old_owner: address,
+        new_owner: address,
+    }
+
+    public struct MultisigSignerAddedEvent has copy, drop {
+        signer: address,
+    }
+
+    public struct MultisigSignerRemovedEvent has copy, drop {
+        signer: address,
+    }
+
+    public struct TransferFeeUpdatedEvent has copy, drop {
+        old_fee_bps: u64,
+        new_fee_bps: u64,
+    }
+
+    public struct FeeRecipientUpdatedEvent has copy, drop {
+        old_recipient: address,
+        new_recipient: address,
+    }
+
+    public struct ContractTokensDistributedEvent has copy, drop {
+        recipient: address,
+        amount: u64,
+    }
+
     // ==================== Init Function ====================
 
     /// Initialize the token contract
@@ -264,17 +325,13 @@ module ssui::ssui {
             total_fees_collected: 0,
         };
 
-        // Mint tokens to creator (1 billion)
+        // Mint all 1.1B SSUI tokens to creator
         coin::mint_and_transfer<SSUI>(
             &mut registry.treasury_cap,
             CREATOR_SUPPLY,
             sender,
             ctx
         );
-
-        // Mint 100M into matrix platform (contract pool) once; register/upgrade take from here (no mint per tx)
-        let contract_coin = coin::mint(&mut registry.treasury_cap, CONTRACT_SUPPLY, ctx);
-        balance::join(&mut registry.contract_supply_balance, coin::into_balance(contract_coin));
         registry.total_minted = TOTAL_SUPPLY;
 
         // Create admin cap for the deployer
@@ -284,7 +341,7 @@ module ssui::ssui {
         };
 
         // Transfer admin cap to deployer
-        transfer::public_transfer(admin_cap, sender);
+        transfer::transfer(admin_cap, sender);
         
         // Share the registry so it can be accessed
         transfer::public_share_object(registry);
@@ -292,15 +349,21 @@ module ssui::ssui {
 
     // ==================== Admin Functions ====================
 
-    /// Transfer ownership of admin cap
+    /// Transfer ownership of admin cap - transfers the actual object to new owner
     public entry fun transfer_ownership(
-        admin_cap: &mut AdminCap,
+        mut admin_cap: AdminCap,
         new_owner: address,
         ctx: &mut TxContext
     ) {
         assert!(admin_cap.owner == tx_context::sender(ctx), ERROR_NOT_OWNER);
         assert!(new_owner != @0x0, ERROR_ZERO_ADDRESS);
+        let old_owner = admin_cap.owner;
         admin_cap.owner = new_owner;
+        transfer::transfer(admin_cap, new_owner);
+        event::emit(OwnershipTransferredEvent {
+            old_owner,
+            new_owner,
+        });
     }
 
     /// Creator only: withdraw any amount of tokens from the contract to a recipient (use sender address to withdraw to self).
@@ -318,6 +381,11 @@ module ssui::ssui {
 
         let to_send = balance::split(&mut registry.contract_supply_balance, amount);
         transfer::public_transfer(coin::from_balance<SSUI>(to_send, ctx), recipient);
+
+        event::emit(ContractTokensDistributedEvent {
+            recipient,
+            amount,
+        });
     }
 
     /// Creator only: give (deposit) any amount of tokens to the smart contract.
@@ -357,6 +425,7 @@ module ssui::ssui {
         };
         
         if (!found) {
+            assert!(len < MAX_AUTHORIZED_MINTERS, ERROR_MAX_MINTERS_REACHED);
             vector::push_back(&mut registry.authorized_minters, minter_address);
         };
     }
@@ -372,43 +441,53 @@ module ssui::ssui {
         
         let mut i = 0;
         let len = vector::length(&registry.authorized_minters);
+        let mut found = false;
         while (i < len) {
             if (*vector::borrow(&registry.authorized_minters, i) == minter_address) {
                 vector::remove(&mut registry.authorized_minters, i);
+                found = true;
                 break
             };
             i = i + 1;
         };
+        assert!(found, ERROR_MINTER_NOT_FOUND);
     }
 
     /// Transfer tokens from contract supply (for authorized callers; takes from pre-allocated pool)
     /// SECURITY: Checks pause state and authorization
     public fun mint_from_contract(
         registry: &mut TokenRegistry,
-        caller: address,
         recipient: address,
         amount: u64,
         ctx: &mut TxContext
     ) {
-        assert!(!registry.is_paused, ERROR_NOT_OWNER);
+        assert!(!registry.is_paused, ERROR_CONTRACT_PAUSED);
         assert!(recipient != @0x0, ERROR_ZERO_ADDRESS);
         assert!(amount > 0, ERROR_INSUFFICIENT_BALANCE);
         assert!(balance::value(&registry.contract_supply_balance) >= amount, ERROR_INSUFFICIENT_BALANCE);
 
+        let sender = tx_context::sender(ctx);
         let mut i = 0;
         let len = vector::length(&registry.authorized_minters);
         let mut authorized = false;
         while (i < len) {
-            if (*vector::borrow(&registry.authorized_minters, i) == caller) {
+            if (*vector::borrow(&registry.authorized_minters, i) == sender) {
                 authorized = true;
                 break
             };
             i = i + 1;
         };
-        assert!(authorized, ERROR_NOT_OWNER);
+        assert!(authorized, ERROR_UNAUTHORIZED_CALLER);
 
         let to_send = balance::split(&mut registry.contract_supply_balance, amount);
         transfer::public_transfer(coin::from_balance<SSUI>(to_send, ctx), recipient);
+
+        event::emit(TransferEvent {
+            from: sender,
+            to: recipient,
+            amount,
+            fee: 0,
+        });
     }
 
     // ==================== Public Functions ====================
@@ -436,24 +515,42 @@ module ssui::ssui {
         });
     }
 
-    /// Transfer tokens to another address
+    /// Transfer tokens to another address (respects pause state and fees)
     public entry fun transfer(
-        coin: Coin<SSUI>,
+        registry: &mut TokenRegistry,
+        mut coin: Coin<SSUI>,
         recipient: address,
         ctx: &mut TxContext
     ) {
+        assert!(!registry.is_paused, ERROR_CONTRACT_PAUSED);
         assert!(recipient != @0x0, ERROR_ZERO_ADDRESS);
-        let amount = coin::value(&coin);
         
-        // Transfer the coin
+        let amount = coin::value(&coin);
+        let fee = if (registry.transfer_fee_bps > 0) {
+            ((((amount as u128) * (registry.transfer_fee_bps as u128)) / 10000u128) as u64)
+        } else {
+            0
+        };
+
+        if (fee > 0) {
+            let fee_coin = coin::split(&mut coin, fee, ctx);
+            transfer::public_transfer(fee_coin, registry.fee_recipient);
+            registry.total_fees_collected = registry.total_fees_collected + fee;
+            event::emit(FeeCollectedEvent {
+                recipient: registry.fee_recipient,
+                amount: fee,
+            });
+        };
+        
+        // Transfer the coin (minus fee)
         transfer::public_transfer(coin, recipient);
         
-        // Emit event
+        // Emit event (amount = total sent by user including fee, consistent with transfer_with_fee)
         event::emit(TransferEvent {
             from: tx_context::sender(ctx),
             to: recipient,
             amount,
-            fee: 0,
+            fee,
         });
     }
 
@@ -547,9 +644,15 @@ module ssui::ssui {
         ctx: &mut TxContext
     ) {
         assert!(admin_cap.owner == tx_context::sender(ctx), ERROR_NOT_OWNER);
-        assert!(fee_bps <= MAX_FEE_BPS, ERROR_NOT_OWNER);
+        assert!(fee_bps <= MAX_FEE_BPS, ERROR_INVALID_FEE_BPS);
         
+        let old_fee_bps = registry.transfer_fee_bps;
         registry.transfer_fee_bps = fee_bps;
+
+        event::emit(TransferFeeUpdatedEvent {
+            old_fee_bps,
+            new_fee_bps: fee_bps,
+        });
     }
 
     /// Set fee recipient (owner only)
@@ -562,7 +665,13 @@ module ssui::ssui {
         assert!(admin_cap.owner == tx_context::sender(ctx), ERROR_NOT_OWNER);
         assert!(recipient != @0x0, ERROR_ZERO_ADDRESS);
         
+        let old_recipient = registry.fee_recipient;
         registry.fee_recipient = recipient;
+
+        event::emit(FeeRecipientUpdatedEvent {
+            old_recipient,
+            new_recipient: recipient,
+        });
     }
 
     /// Emergency pause/unpause contract (owner only)
@@ -590,7 +699,7 @@ module ssui::ssui {
         recipient: address,
         ctx: &mut TxContext
     ) {
-        assert!(!registry.is_paused, ERROR_NOT_OWNER);
+        assert!(!registry.is_paused, ERROR_CONTRACT_PAUSED);
         assert!(recipient != @0x0, ERROR_ZERO_ADDRESS);
         
         let amount = coin::value(&coin);
@@ -600,8 +709,6 @@ module ssui::ssui {
         } else {
             0
         };
-        
-        let transfer_amount = amount - fee;
         
         // Split fee if applicable
         if (fee > 0) {
@@ -618,16 +725,16 @@ module ssui::ssui {
         // Transfer remaining amount
         transfer::public_transfer(coin, recipient);
         
-        // Emit transfer event
+        // Emit transfer event (amount = total sent by user including fee)
         event::emit(TransferEvent {
             from: tx_context::sender(ctx),
             to: recipient,
-            amount: transfer_amount,
+            amount,
             fee,
         });
     }
 
-    /// Batch transfer for exchanges (multiple recipients)
+    /// Batch transfer for exchanges (multiple recipients, with fee deduction per transfer)
     public entry fun batch_transfer(
         registry: &mut TokenRegistry,
         mut coin: Coin<SSUI>,
@@ -635,8 +742,10 @@ module ssui::ssui {
         amounts: vector<u64>,
         ctx: &mut TxContext
     ) {
-        assert!(!registry.is_paused, ERROR_NOT_OWNER);
-        assert!(vector::length(&recipients) == vector::length(&amounts), ERROR_NOT_OWNER);
+        assert!(!registry.is_paused, ERROR_CONTRACT_PAUSED);
+        assert!(vector::length(&recipients) == vector::length(&amounts), ERROR_INVALID_INPUT);
+        assert!(vector::length(&recipients) > 0, ERROR_INVALID_INPUT);
+        assert!(vector::length(&recipients) <= MAX_BATCH_SIZE, ERROR_BATCH_TOO_LARGE);
         
         let sender = tx_context::sender(ctx);
         let mut i = 0;
@@ -650,14 +759,32 @@ module ssui::ssui {
             assert!(amount > 0, ERROR_INSUFFICIENT_BALANCE);
             assert!(coin::value(&coin) >= amount, ERROR_INSUFFICIENT_BALANCE);
             
-            let transfer_coin = coin::split(&mut coin, amount, ctx);
+            let mut transfer_coin = coin::split(&mut coin, amount, ctx);
+
+            // Deduct fee per transfer (consistent with transfer/transfer_with_fee)
+            let fee = if (registry.transfer_fee_bps > 0) {
+                ((((amount as u128) * (registry.transfer_fee_bps as u128)) / 10000u128) as u64)
+            } else {
+                0
+            };
+
+            if (fee > 0) {
+                let fee_coin = coin::split(&mut transfer_coin, fee, ctx);
+                transfer::public_transfer(fee_coin, registry.fee_recipient);
+                registry.total_fees_collected = registry.total_fees_collected + fee;
+                event::emit(FeeCollectedEvent {
+                    recipient: registry.fee_recipient,
+                    amount: fee,
+                });
+            };
+
             transfer::public_transfer(transfer_coin, recipient);
             
             event::emit(TransferEvent {
                 from: sender,
                 to: recipient,
                 amount,
-                fee: 0,
+                fee,
             });
             
             i = i + 1;
@@ -712,29 +839,33 @@ module ssui::ssui {
     /// Transfer from contract supply with fee (for authorized callers; takes from pre-allocated pool)
     public entry fun mint_with_fee(
         registry: &mut TokenRegistry,
-        caller: address,
         recipient: address,
         amount: u64,
         fee_bps: u64,
         fee_recipient: address,
         ctx: &mut TxContext
     ) {
-        assert!(!registry.is_paused, ERROR_NOT_OWNER);
+        assert!(!registry.is_paused, ERROR_CONTRACT_PAUSED);
         assert!(recipient != @0x0, ERROR_ZERO_ADDRESS);
         assert!(amount > 0, ERROR_INSUFFICIENT_BALANCE);
-        assert!(fee_bps <= MAX_FEE_BPS, ERROR_NOT_OWNER);
+        assert!(fee_bps <= MAX_FEE_BPS, ERROR_INVALID_FEE_BPS);
+        // Ensure fee_recipient is valid when fee is expected
+        if (fee_bps > 0) {
+            assert!(fee_recipient != @0x0, ERROR_ZERO_ADDRESS);
+        };
 
+        let sender = tx_context::sender(ctx);
         let mut i = 0;
         let len = vector::length(&registry.authorized_minters);
         let mut authorized = false;
         while (i < len) {
-            if (*vector::borrow(&registry.authorized_minters, i) == caller) {
+            if (*vector::borrow(&registry.authorized_minters, i) == sender) {
                 authorized = true;
                 break
             };
             i = i + 1;
         };
-        assert!(authorized, ERROR_NOT_OWNER);
+        assert!(authorized, ERROR_UNAUTHORIZED_CALLER);
 
         // Use u128 to prevent overflow: amount (up to ~10^19) * fee_bps (up to 10000)
         let fee = if (fee_bps > 0) { ((((amount as u128) * (fee_bps as u128)) / 10000u128) as u64) } else { 0 };
@@ -743,9 +874,14 @@ module ssui::ssui {
 
         let to_recipient = balance::split(&mut registry.contract_supply_balance, mint_amount);
         transfer::public_transfer(coin::from_balance<SSUI>(to_recipient, ctx), recipient);
-        if (fee > 0 && fee_recipient != @0x0) {
+        if (fee > 0) {
             let to_fee = balance::split(&mut registry.contract_supply_balance, fee);
             transfer::public_transfer(coin::from_balance<SSUI>(to_fee, ctx), fee_recipient);
+            registry.total_fees_collected = registry.total_fees_collected + fee;
+            event::emit(FeeCollectedEvent {
+                recipient: fee_recipient,
+                amount: fee,
+            });
         };
     }
 
@@ -757,11 +893,24 @@ module ssui::ssui {
         amount: u64,
         ctx: &mut TxContext
     ) {
+        assert!(!registry.is_paused, ERROR_CONTRACT_PAUSED);
         assert!(recipient != @0x0, ERROR_ZERO_ADDRESS);
         assert!(amount > 0, ERROR_INSUFFICIENT_BALANCE);
         assert!(balance::value(&registry.contract_supply_balance) >= amount, ERROR_INSUFFICIENT_BALANCE);
 
         let sender = tx_context::sender(ctx);
+        let mut i = 0;
+        let len = vector::length(&registry.authorized_minters);
+        let mut authorized = false;
+        while (i < len) {
+            if (*vector::borrow(&registry.authorized_minters, i) == sender) {
+                authorized = true;
+                break
+            };
+            i = i + 1;
+        };
+        assert!(authorized, ERROR_UNAUTHORIZED_CALLER);
+
         let to_send = balance::split(&mut registry.contract_supply_balance, amount);
         transfer::public_transfer(coin::from_balance<SSUI>(to_send, ctx), recipient);
 
@@ -826,6 +975,7 @@ module ssui::ssui {
         ctx: &mut TxContext
     ) {
         assert!(admin_cap.owner == tx_context::sender(ctx), ERROR_NOT_OWNER);
+        assert!(allowlist.admin_cap_id == object::id(admin_cap), ERROR_ADMIN_CAP_MISMATCH);
         assert!(!allowlist.enabled, ERROR_ALLOWLIST_ENABLED);
         
         allowlist.enabled = true;
@@ -844,6 +994,7 @@ module ssui::ssui {
         ctx: &mut TxContext
     ) {
         assert!(admin_cap.owner == tx_context::sender(ctx), ERROR_NOT_OWNER);
+        assert!(allowlist.admin_cap_id == object::id(admin_cap), ERROR_ADMIN_CAP_MISMATCH);
         assert!(allowlist.enabled, ERROR_ALLOWLIST_DISABLED);
         
         allowlist.enabled = false;
@@ -863,6 +1014,7 @@ module ssui::ssui {
         ctx: &mut TxContext
     ) {
         assert!(admin_cap.owner == tx_context::sender(ctx), ERROR_NOT_OWNER);
+        assert!(allowlist.admin_cap_id == object::id(admin_cap), ERROR_ADMIN_CAP_MISMATCH);
         assert!(addr != @0x0, ERROR_ZERO_ADDRESS);
         
         // Check if already allowlisted
@@ -875,6 +1027,7 @@ module ssui::ssui {
             i = i + 1;
         };
         
+        assert!(len < MAX_ALLOWLIST_SIZE, ERROR_MAX_ALLOWLIST_REACHED);
         vector::push_back(&mut allowlist.allowlist, addr);
         
         event::emit(AllowlistUpdatedEvent {
@@ -892,6 +1045,7 @@ module ssui::ssui {
         ctx: &mut TxContext
     ) {
         assert!(admin_cap.owner == tx_context::sender(ctx), ERROR_NOT_OWNER);
+        assert!(allowlist.admin_cap_id == object::id(admin_cap), ERROR_ADMIN_CAP_MISMATCH);
         
         let mut i = 0;
         let len = vector::length(&allowlist.allowlist);
@@ -937,12 +1091,15 @@ module ssui::ssui {
     }
 
     /// Transfer with allowlist check (for KYC compliance)
+    /// SECURITY: Respects pause state, fee deduction, and allowlist restrictions
     public entry fun transfer_with_allowlist_check(
+        registry: &mut TokenRegistry,
         allowlist: &TransferAllowlist,
-        coin: Coin<SSUI>,
+        mut coin: Coin<SSUI>,
         recipient: address,
         ctx: &mut TxContext
     ) {
+        assert!(!registry.is_paused, ERROR_CONTRACT_PAUSED);
         assert!(recipient != @0x0, ERROR_ZERO_ADDRESS);
         
         // If allowlist is enabled, recipient must be allowlisted
@@ -951,6 +1108,21 @@ module ssui::ssui {
         };
         
         let amount = coin::value(&coin);
+        let fee = if (registry.transfer_fee_bps > 0) {
+            ((((amount as u128) * (registry.transfer_fee_bps as u128)) / 10000u128) as u64)
+        } else {
+            0
+        };
+
+        if (fee > 0) {
+            let fee_coin = coin::split(&mut coin, fee, ctx);
+            transfer::public_transfer(fee_coin, registry.fee_recipient);
+            registry.total_fees_collected = registry.total_fees_collected + fee;
+            event::emit(FeeCollectedEvent {
+                recipient: registry.fee_recipient,
+                amount: fee,
+            });
+        };
         
         transfer::public_transfer(coin, recipient);
         
@@ -958,7 +1130,7 @@ module ssui::ssui {
             from: tx_context::sender(ctx),
             to: recipient,
             amount,
-            fee: 0,
+            fee,
         });
     }
 
@@ -1000,15 +1172,20 @@ module ssui::ssui {
     public entry fun list_in_kiosk(
         kiosk: &mut Kiosk,
         kiosk_owner_cap: &kiosk::KioskOwnerCap,
+        listing: &mut KioskListing,
         coin: Coin<SSUI>,
         price: u64,
         _ctx: &mut TxContext
     ) {
         let amount = coin::value(&coin);
         let kiosk_id = object::id(kiosk);
+        let item_id = object::id(&coin);
         
-        // Place the coin in the kiosk for sale
+        // Place the coin in the kiosk and list it for sale
         kiosk::place(kiosk, kiosk_owner_cap, coin);
+        kiosk::list<Coin<SSUI>>(kiosk, kiosk_owner_cap, item_id, price);
+        
+        listing.listing_count = listing.listing_count + 1;
         
         event::emit(KioskListedEvent {
             kiosk_id,
@@ -1108,12 +1285,35 @@ module ssui::ssui {
     ) {
         assert!(admin_cap.owner == tx_context::sender(ctx), ERROR_NOT_OWNER);
         assert!(threshold > 0, ERROR_INVALID_THRESHOLD);
-        assert!(threshold <= vector::length(&initial_signers), ERROR_INVALID_THRESHOLD);
         assert!(vector::length(&initial_signers) <= MAX_MULTISIG_SIGNERS, ERROR_INVALID_THRESHOLD);
+
+        // Deduplicate signers to prevent inflated signer count
+        let mut deduped = vector::empty<address>();
+        let mut i = 0;
+        let len = vector::length(&initial_signers);
+        while (i < len) {
+            let signer_addr = *vector::borrow(&initial_signers, i);
+            assert!(signer_addr != @0x0, ERROR_ZERO_ADDRESS);
+            let mut j = 0;
+            let dlen = vector::length(&deduped);
+            let mut dup = false;
+            while (j < dlen) {
+                if (*vector::borrow(&deduped, j) == signer_addr) {
+                    dup = true;
+                    break
+                };
+                j = j + 1;
+            };
+            if (!dup) {
+                vector::push_back(&mut deduped, signer_addr);
+            };
+            i = i + 1;
+        };
+        assert!(threshold <= vector::length(&deduped), ERROR_INVALID_THRESHOLD);
         
         let multisig = MultisigConfig {
             id: object::new(ctx),
-            signers: initial_signers,
+            signers: deduped,
             threshold,
             nonce: 0,
         };
@@ -1144,6 +1344,8 @@ module ssui::ssui {
     ) {
         let sender = tx_context::sender(ctx);
         assert!(is_multisig_signer(multisig, sender), ERROR_NOT_MULTISIG_SIGNER);
+        // Validate action_type is supported (1=transfer_ownership, 2=set_fee, 3=pause)
+        assert!(action_type >= ACTION_TRANSFER_OWNERSHIP && action_type <= ACTION_TOGGLE_PAUSE, ERROR_INVALID_ACTION_TYPE);
         
         let current_time = tx_context::epoch_timestamp_ms(ctx);
         let execute_after = current_time + TIMELOCK_DURATION_MS;
@@ -1204,17 +1406,21 @@ module ssui::ssui {
         });
     }
 
-    /// Execute a multisig action after threshold is met and timelock expired
+    /// Execute a non-ownership multisig action (set_fee, toggle_pause) after threshold is met and timelock expired
+    /// For ownership transfer, use execute_multisig_ownership_transfer instead
     public entry fun execute_multisig_action(
         multisig: &MultisigConfig,
         action: PendingAction,
         registry: &mut TokenRegistry,
-        admin_cap: &mut AdminCap,
+        admin_cap: &AdminCap,
         ctx: &mut TxContext
     ) {
         let sender = tx_context::sender(ctx);
-        assert!(is_multisig_signer(multisig, sender), ERROR_NOT_MULTISIG_SIGNER);
-        assert!(vector::length(&action.signatures) >= multisig.threshold, ERROR_NOT_OWNER);
+        assert!(
+            admin_cap.owner == sender || is_multisig_signer(multisig, sender),
+            ERROR_NOT_MULTISIG_SIGNER
+        );
+        assert!(vector::length(&action.signatures) >= multisig.threshold, ERROR_INVALID_THRESHOLD);
         
         let current_time = tx_context::epoch_timestamp_ms(ctx);
         assert!(current_time >= action.execute_after, ERROR_TIMELOCK_NOT_READY);
@@ -1222,16 +1428,27 @@ module ssui::ssui {
         let action_id = object::id(&action);
         let action_type = action.action_type;
         
-        // Execute the action based on type
-        if (action_type == 1) {
-            // Transfer ownership
-            admin_cap.owner = action.target_address;
-        } else if (action_type == 2) {
+        // Only non-ownership actions allowed here
+        assert!(action_type != ACTION_TRANSFER_OWNERSHIP, ERROR_INVALID_ACTION_TYPE);
+        
+        if (action_type == 2) {
             // Set transfer fee
+            assert!(action.amount <= MAX_FEE_BPS, ERROR_INVALID_FEE_BPS);
+            let old_fee_bps = registry.transfer_fee_bps;
             registry.transfer_fee_bps = action.amount;
+            event::emit(TransferFeeUpdatedEvent {
+                old_fee_bps,
+                new_fee_bps: action.amount,
+            });
         } else if (action_type == 3) {
             // Toggle pause
             registry.is_paused = !registry.is_paused;
+            event::emit(PauseEvent {
+                paused: registry.is_paused,
+                reason: string::utf8(b"multisig action"),
+            });
+        } else {
+            abort ERROR_INVALID_ACTION_TYPE
         };
         
         // Delete the action
@@ -1245,20 +1462,67 @@ module ssui::ssui {
         });
     }
 
-    /// Cancel a pending multisig action (any signer can cancel)
-    public entry fun cancel_multisig_action(
+    /// Execute a multisig ownership transfer - takes AdminCap by value and transfers to new owner
+    public entry fun execute_multisig_ownership_transfer(
         multisig: &MultisigConfig,
         action: PendingAction,
+        mut admin_cap: AdminCap,
         ctx: &mut TxContext
     ) {
         let sender = tx_context::sender(ctx);
-        assert!(is_multisig_signer(multisig, sender), ERROR_NOT_MULTISIG_SIGNER);
+        assert!(
+            admin_cap.owner == sender || is_multisig_signer(multisig, sender),
+            ERROR_NOT_MULTISIG_SIGNER
+        );
+        assert!(vector::length(&action.signatures) >= multisig.threshold, ERROR_INVALID_THRESHOLD);
         
-        let _action_id = object::id(&action);
+        let current_time = tx_context::epoch_timestamp_ms(ctx);
+        assert!(current_time >= action.execute_after, ERROR_TIMELOCK_NOT_READY);
+        
+        let action_id = object::id(&action);
+        let action_type = action.action_type;
+        assert!(action_type == ACTION_TRANSFER_OWNERSHIP, ERROR_INVALID_ACTION_TYPE);
+        
+        let new_owner = action.target_address;
+        assert!(new_owner != @0x0, ERROR_ZERO_ADDRESS);
+        let old_owner = admin_cap.owner;
+        admin_cap.owner = new_owner;
+        transfer::transfer(admin_cap, new_owner);
         
         // Delete the action
         let PendingAction { id, action_type: _, target_address: _, amount: _, execute_after: _, signatures: _, created_at: _ } = action;
         object::delete(id);
+        
+        event::emit(MultisigActionExecutedEvent {
+            action_id,
+            action_type,
+            executed_by: sender,
+        });
+        event::emit(OwnershipTransferredEvent {
+            old_owner,
+            new_owner,
+        });
+    }
+
+    /// Cancel a pending multisig action (admin only to prevent griefing by rogue signer)
+    public entry fun cancel_multisig_action(
+        admin_cap: &AdminCap,
+        action: PendingAction,
+        ctx: &mut TxContext
+    ) {
+        let sender = tx_context::sender(ctx);
+        assert!(admin_cap.owner == sender, ERROR_NOT_OWNER);
+        
+        let action_id = object::id(&action);
+        
+        // Delete the action
+        let PendingAction { id, action_type: _, target_address: _, amount: _, execute_after: _, signatures: _, created_at: _ } = action;
+        object::delete(id);
+
+        event::emit(MultisigActionCancelledEvent {
+            action_id,
+            cancelled_by: sender,
+        });
     }
 
     // ==================== Timelock Functions ====================
@@ -1273,6 +1537,8 @@ module ssui::ssui {
         ctx: &mut TxContext
     ) {
         assert!(admin_cap.owner == tx_context::sender(ctx), ERROR_NOT_OWNER);
+        // Validate action_type is supported (1=set_fee, 2=set_fee_recipient, 3=toggle_pause)
+        assert!(action_type >= TIMELOCK_SET_FEE && action_type <= TIMELOCK_TOGGLE_PAUSE, ERROR_INVALID_ACTION_TYPE);
         
         let current_time = tx_context::epoch_timestamp_ms(ctx);
         let execute_after = current_time + TIMELOCK_DURATION_MS;
@@ -1298,10 +1564,10 @@ module ssui::ssui {
         });
     }
 
-    /// Execute a timelocked action after delay
+    /// Execute a timelocked action after delay and delete the object
     public entry fun execute_timelocked_action(
         admin_cap: &AdminCap,
-        action: &mut TimelockedAction,
+        action: TimelockedAction,
         registry: &mut TokenRegistry,
         ctx: &mut TxContext
     ) {
@@ -1311,22 +1577,42 @@ module ssui::ssui {
         let current_time = tx_context::epoch_timestamp_ms(ctx);
         assert!(current_time >= action.execute_after, ERROR_TIMELOCK_NOT_READY);
         
-        let action_id = object::id(action);
+        let action_id = object::id(&action);
         let action_type = action.action_type;
         
         // Execute the action based on type
         if (action_type == 1) {
             // Set transfer fee
+            assert!(action.amount <= MAX_FEE_BPS, ERROR_INVALID_FEE_BPS);
+            let old_fee_bps = registry.transfer_fee_bps;
             registry.transfer_fee_bps = action.amount;
+            event::emit(TransferFeeUpdatedEvent {
+                old_fee_bps,
+                new_fee_bps: action.amount,
+            });
         } else if (action_type == 2) {
             // Set fee recipient
+            assert!(action.target_address != @0x0, ERROR_ZERO_ADDRESS);
+            let old_recipient = registry.fee_recipient;
             registry.fee_recipient = action.target_address;
+            event::emit(FeeRecipientUpdatedEvent {
+                old_recipient,
+                new_recipient: action.target_address,
+            });
         } else if (action_type == 3) {
             // Toggle pause
             registry.is_paused = !registry.is_paused;
+            event::emit(PauseEvent {
+                paused: registry.is_paused,
+                reason: string::utf8(b"timelock action"),
+            });
+        } else {
+            abort ERROR_INVALID_ACTION_TYPE
         };
         
-        action.executed = true;
+        // Delete the object to free on-chain storage
+        let TimelockedAction { id, action_type: _, target_address: _, amount: _, execute_after: _, created_at: _, executed: _ } = action;
+        object::delete(id);
         
         event::emit(TimelockExecutedEvent {
             action_id,
@@ -1335,21 +1621,88 @@ module ssui::ssui {
         });
     }
 
-    /// Cancel a timelocked action (owner only)
+    /// Cancel a timelocked action and delete the object (owner only)
     public entry fun cancel_timelocked_action(
         admin_cap: &AdminCap,
-        action: &mut TimelockedAction,
+        action: TimelockedAction,
         ctx: &mut TxContext
     ) {
         assert!(admin_cap.owner == tx_context::sender(ctx), ERROR_NOT_OWNER);
         assert!(!action.executed, ERROR_NO_PENDING_ACTION);
         
-        action.executed = true; // Mark as executed to prevent future execution
+        let action_id = object::id(&action);
+        
+        // Delete the object to free on-chain storage
+        let TimelockedAction { id, action_type: _, target_address: _, amount: _, execute_after: _, created_at: _, executed: _ } = action;
+        object::delete(id);
+
+        event::emit(TimelockCancelledEvent {
+            action_id,
+            cancelled_by: tx_context::sender(ctx),
+        });
     }
 
     /// Get multisig config info
     public fun get_multisig_info(multisig: &MultisigConfig): (vector<address>, u64, u64) {
         (multisig.signers, multisig.threshold, multisig.nonce)
+    }
+
+    /// Add a signer to multisig config (owner only)
+    public entry fun add_multisig_signer(
+        multisig: &mut MultisigConfig,
+        admin_cap: &AdminCap,
+        new_signer: address,
+        ctx: &mut TxContext
+    ) {
+        assert!(admin_cap.owner == tx_context::sender(ctx), ERROR_NOT_OWNER);
+        assert!(new_signer != @0x0, ERROR_ZERO_ADDRESS);
+        assert!(!is_multisig_signer(multisig, new_signer), ERROR_ALREADY_SIGNED);
+        assert!(vector::length(&multisig.signers) < MAX_MULTISIG_SIGNERS, ERROR_INVALID_THRESHOLD);
+
+        vector::push_back(&mut multisig.signers, new_signer);
+
+        event::emit(MultisigSignerAddedEvent { signer: new_signer });
+    }
+
+    /// Remove a signer from multisig config (owner only)
+    public entry fun remove_multisig_signer(
+        multisig: &mut MultisigConfig,
+        admin_cap: &AdminCap,
+        signer_to_remove: address,
+        ctx: &mut TxContext
+    ) {
+        assert!(admin_cap.owner == tx_context::sender(ctx), ERROR_NOT_OWNER);
+
+        let mut i = 0;
+        let len = vector::length(&multisig.signers);
+        let mut found = false;
+        while (i < len) {
+            if (*vector::borrow(&multisig.signers, i) == signer_to_remove) {
+                vector::remove(&mut multisig.signers, i);
+                found = true;
+                break
+            };
+            i = i + 1;
+        };
+        assert!(found, ERROR_NOT_MULTISIG_SIGNER);
+        // Ensure threshold is still valid
+        assert!(multisig.threshold <= vector::length(&multisig.signers), ERROR_INVALID_THRESHOLD);
+
+        event::emit(MultisigSignerRemovedEvent { signer: signer_to_remove });
+    }
+
+    /// Update multisig threshold (owner only)
+    public entry fun update_multisig_threshold(
+        multisig: &mut MultisigConfig,
+        admin_cap: &AdminCap,
+        new_threshold: u64,
+        ctx: &mut TxContext
+    ) {
+        assert!(admin_cap.owner == tx_context::sender(ctx), ERROR_NOT_OWNER);
+        assert!(new_threshold > 0, ERROR_INVALID_THRESHOLD);
+        assert!(new_threshold <= vector::length(&multisig.signers), ERROR_INVALID_THRESHOLD);
+
+        multisig.threshold = new_threshold;
     }
 
     /// Get pending action info
@@ -1379,6 +1732,8 @@ module ssui::ssui {
             option::some(url::new_unsafe_from_bytes(LOGO_URL)),
             ctx
         );
+
+        let metadata_id = object::id(&metadata);
         
         transfer::public_share_object(metadata);
         
@@ -1387,7 +1742,7 @@ module ssui::ssui {
             treasury_cap,
             total_minted: 0,
             total_burned: 0,
-            metadata_id: object::id(&metadata),
+            metadata_id,
             contract_supply_balance: balance::zero(),
             authorized_minters: vector::empty(),
             transfer_fee_bps: DEFAULT_TRANSFER_FEE_BPS,
@@ -1402,9 +1757,6 @@ module ssui::ssui {
             sender,
             ctx
         );
-        
-        let contract_coin = coin::mint(&mut registry.treasury_cap, CONTRACT_SUPPLY, ctx);
-        balance::join(&mut registry.contract_supply_balance, coin::into_balance(contract_coin));
         registry.total_minted = TOTAL_SUPPLY;
         
         let admin_cap = AdminCap {
@@ -1412,7 +1764,7 @@ module ssui::ssui {
             owner: sender,
         };
         
-        transfer::public_transfer(admin_cap, sender);
+        transfer::transfer(admin_cap, sender);
         transfer::public_share_object(registry);
     }
 }
