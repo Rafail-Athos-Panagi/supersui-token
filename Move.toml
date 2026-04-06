@@ -2,10 +2,10 @@
 name = "supersuitoken"
 version = "1.0.0"
 edition = "2024"
-published-at = "0x1a87b969fb7e41d402f778e5811e45af61ddeee43e97e337ef2adb3bf20b1358"
+published-at = "0x3ef50064e39071fc326da67cfbea4a5905a80541d8a95dc07ff28e320c772389"
 
 [addresses]
-ssui = "0x1a87b969fb7e41d402f778e5811e45af61ddeee43e97e337ef2adb3bf20b1358"
+ssui = "0x3ef50064e39071fc326da67cfbea4a5905a80541d8a95dc07ff28e320c772389"
 
 [dependencies]
 Sui = { git = "https://github.com/MystenLabs/sui.git", subdir = "crates/sui-framework/packages/sui-framework", rev = "testnet-v1.62.0" }
