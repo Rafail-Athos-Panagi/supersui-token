@@ -44,7 +44,7 @@ module ssui::ssui {
     const TOTAL_SUPPLY: u64 = 1_100_000_000_000_000_000; // 1.1 billion SSUI (with 9 decimals)
     const CREATOR_SUPPLY: u64 = 1_100_000_000_000_000_000; // 1.1 billion SSUI to creator
     const CONTRACT_SUPPLY: u64 = 0; // Contract pool starts empty; creator deposits later
-    const LOGO_URL: vector<u8> = b"https://i.postimg.cc/1X6mTW3h/ssui.png";
+    const LOGO_URL: vector<u8> = b"https://i.postimg.cc/RVMd9xh5/Super-SUI-token-logo.png";
     
     // Exchange and project integration constants
     const MAX_FEE_BPS: u64 = 1000; // 10% max in basis points
